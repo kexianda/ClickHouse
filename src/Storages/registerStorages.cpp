@@ -28,6 +28,8 @@ void registerStorages()
     registerStorageLiveView(factory);
     registerStorageGenerateRandom(factory);
 
+    registerStorageHTAP(factory);
+
 #if USE_AWS_S3
     registerStorageS3(factory);
     registerStorageCOS(factory);

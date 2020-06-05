@@ -116,6 +116,7 @@ SRCS(
     StorageFactory.cpp
     StorageFile.cpp
     StorageGenerateRandom.cpp
+    StorageHTAP.cpp
     StorageInMemoryMetadata.cpp
     StorageInput.cpp
     StorageJoin.cpp
