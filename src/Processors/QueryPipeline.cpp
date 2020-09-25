@@ -70,6 +70,13 @@ void QueryPipeline::init(Pipe pipe_)
         throw Exception("Can't initialize pipeline with empty pipe.", ErrorCodes::LOGICAL_ERROR);
 
     auto * collected_processors = pipe.collected_processors;
+
+    if (collected_processors)
+    {
+        for (const auto & processor : pipe.getProcessors())
+            collected_processors->emplace_back(processor.get());
+    }
+
     pipe = std::move(pipe_);
     pipe.collected_processors = collected_processors;
 }
