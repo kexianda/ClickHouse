@@ -1107,9 +1107,9 @@ static StreamLocalLimits getLimitsForStorage(const Settings & settings, const Se
     return limits;
 }
 
-static void addEmptySource(QueryPlan & query_plan, const Block & header, SelectQueryInfo & query_info)
+static void addEmptySource(QueryPlan & query_plan, const Block & source_header, SelectQueryInfo & query_info)
 {
-    Pipe pipe(std::make_shared<NullSource>(header));
+    Pipe pipe(std::make_shared<NullSource>(source_header));
 
     if (query_info.prewhere_info)
     {
