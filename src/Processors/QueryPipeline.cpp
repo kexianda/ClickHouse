@@ -69,7 +69,9 @@ void QueryPipeline::init(Pipe pipe_)
     if (pipe_.empty())
         throw Exception("Can't initialize pipeline with empty pipe.", ErrorCodes::LOGICAL_ERROR);
 
+    auto * collected_processors = pipe.collected_processors;
     pipe = std::move(pipe_);
+    pipe.collected_processors = collected_processors;
 }
 
 void QueryPipeline::reset()
