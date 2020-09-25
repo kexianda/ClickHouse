@@ -14,7 +14,7 @@ ReadFromPreparedSource::ReadFromPreparedSource(Pipe pipe_, std::shared_ptr<Conte
 void ReadFromPreparedSource::initializePipeline(QueryPipeline & pipeline)
 {
     for (const auto & processor : pipe.getProcessors())
-        processors.emplace_back(processor.get());
+        processors.emplace_back(processor);
 
     pipeline.init(std::move(pipe));
 
