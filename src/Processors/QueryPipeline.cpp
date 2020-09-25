@@ -73,7 +73,7 @@ void QueryPipeline::init(Pipe pipe_)
 
     if (collected_processors)
     {
-        for (const auto & processor : pipe.getProcessors())
+        for (const auto & processor : pipe_.getProcessors())
             collected_processors->emplace_back(processor.get());
     }
 
