@@ -24,17 +24,26 @@ class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public ISt
     void startup() override;
     void shutdown() override;
 
-    Pipes read(
-        const Names& column_names,
-        const SelectQueryInfo& query_info,
-        const Context& context,
+    //StorageMetadataPtr getInMemoryMetadataPtr() const { return base_storage->getInMemoryMetadataPtr(); }
+    //StorageInMemoryMetadata getInMemoryMetadata() const { return base_storage->getInMemoryMetadata(); }
+
+    Pipe read(
+        const Names & column_names,
+        const StorageMetadataPtr & metadata_snapshot,
+        const SelectQueryInfo & query_info,
+        const Context & context,
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
         unsigned num_streams) override;
 
-    BlockOutputStreamPtr write(const ASTPtr& query, const Context& context) override;
+    BlockOutputStreamPtr write(
+      const ASTPtr& query,
+      const StorageMetadataPtr & /*metadata_snapshot*/,
+      const Context& context) override;
 
-    bool optimize(const ASTPtr& query,
+    bool optimize(
+      const ASTPtr& query,
+      const StorageMetadataPtr & /*metadata_snapshot*/,
                   const ASTPtr& partition,
                   bool final,
                   bool deduplicate,
@@ -44,7 +53,20 @@ class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public ISt
 
     void drop() override;
 
-    void truncate(const ASTPtr&, const Context&, TableStructureWriteLockHolder&) override;
+    void truncate(
+        const ASTPtr & /*query*/,
+        const StorageMetadataPtr & /* metadata_snapshot */,
+        const Context & /* context */,
+        TableExclusiveLockHolder &) override;
+
+    NamesAndTypesList getVirtuals() const override;
+
+    IStorage::ColumnSizeByName getColumnSizes() const override;
+
+    bool supportsFinal() const override { return true; }
+
+
+    StoragePtr getBaseStorage() const { return base_storage; }
 
     std::optional<UInt64> totalRows() const override;
     std::optional<UInt64> totalBytes() const override { return 1024UL; }
@@ -56,6 +78,14 @@ class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public ISt
     std::shared_ptr<IStorage> base_storage;
 
     uint64_t table_size;
+
+  private:
+
+//    BackgroundSchedulePool & bg_pool;
+//    BackgroundSchedulePoolTaskHolder flush_handle;
+
+    // StoragePtr base_storage;
+    Poco::Logger * logger;
 };
 
 }

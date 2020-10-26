@@ -11,6 +11,8 @@
 
 #include <Processors/ISimpleTransform.h>
 #include <Processors/Pipe.h>
+#include <Processors/Transforms/FilterTransform.h>
+
 
 namespace DB {
 
@@ -39,7 +41,7 @@ class TableMerger : public ISimpleTransform {
     String getName() const override { return "TableReader"; }
 
     Status prepare() override {
-        Logger* logger = &Logger::get("TableReader");
+        Poco::Logger* logger = &Poco::Logger::get("TableReader");
 
         LOG_INFO(logger,
                  "Prepare reading HTAP table '{}'.",
@@ -115,10 +117,10 @@ class TableMerger : public ISimpleTransform {
 
   protected:
     void transform(Chunk& chunk) override {
-        Logger* logger = &Logger::get("TableReader");
+        Poco::Logger* logger = &Poco::Logger::get("TableMerger");
 
         LOG_INFO(logger,
-                 "Reading HTAP table '{}'.",
+                 "Merging HTAP table '{}'.",
                  storage->getStorageID().getFullTableName());
 
         std::lock_guard lock(storage->mutex);
@@ -131,7 +133,7 @@ class TableMerger : public ISimpleTransform {
         for (const std::string& col_name : column_names) {
             LOG_INFO(logger, "Read include column '{}'.", col_name);
             uint32_t pos = 0;
-            for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
+            for (const auto& col_name_type : storage->getInMemoryMetadataPtr()->getColumns().getAllPhysical()) {
                 if (col_name == col_name_type.name) {
                     columns.push_back(col_name_type.type->createColumn());
                     column_positions.push_back(pos);
@@ -165,7 +167,7 @@ class TableMerger : public ISimpleTransform {
                 getInputPort().getHeader().cloneWithColumns(chunk.detachColumns());
 
             Columns pk_cols;
-            for (const auto& pk_col_name : storage->getPrimaryKeyColumns()) {
+            for (const auto& pk_col_name : storage->getInMemoryMetadataPtr()->getPrimaryKeyColumns()) {
                 LOG_INFO(logger, "Primary key column: '{}'.", pk_col_name);
                 pk_cols.push_back(raw_data.getByName(pk_col_name).column);
             }
@@ -208,7 +210,7 @@ class TableMerger : public ISimpleTransform {
 class TableReader : public SourceWithProgress {
   public:
     TableReader(const Names& column_names_, StorageHTAP* storage_)
-        : SourceWithProgress{storage_->getSampleBlockForColumns(column_names_)},
+        : SourceWithProgress{storage_->getInMemoryMetadataPtr()->getSampleBlockForColumns(column_names_, storage_->getVirtuals(), storage_->getStorageID())},
           column_names{column_names_}, storage(storage_), generated{false} {}
 
     String getName() const override { return "Table"; }
@@ -227,7 +229,7 @@ class TableReader : public SourceWithProgress {
 
         for (const std::string& col_name : column_names) {
             uint32_t pos = 0;
-            for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
+            for (const auto& col_name_type : storage->getInMemoryMetadataPtr()->getColumns().getAllPhysical()) {
                 if (col_name == col_name_type.name) {
                     columns.push_back(col_name_type.type->createColumn());
                     column_positions.push_back(pos);
@@ -259,31 +261,32 @@ class TableReader : public SourceWithProgress {
 
 class TableWriter : public IBlockOutputStream {
   public:
-    explicit TableWriter(StorageHTAP* storage_, const Context& context_)
-        : storage{storage_}, context{context_} {}
+    explicit TableWriter(StorageHTAP* storage_,const StorageMetadataPtr & metadata_snapshot_, const Context& context_)
+        : storage{storage_}, context{context_}, metadata_snapshot(metadata_snapshot_) {}
 
     Block getHeader() const override {
-        return storage->getSampleBlock();
+        return storage->getBaseStorage()->getInMemoryMetadataPtr()->getSampleBlock();
     }
 
     void write(const Block& block) override {
-        Logger* logger = &Logger::get("TableWriter");
+        Poco::Logger* logger = &Poco::Logger::get("TableWriter");
 
         LOG_INFO(logger,
                  "Writing HTAP table '{}'.",
                  storage->getStorageID().getFullTableName());
 
-        storage->check(block, true);
+        metadata_snapshot = storage->getInMemoryMetadataPtr();
+        metadata_snapshot->check(block, true);
         std::lock_guard lock(storage->mutex);
 
         Columns pk_cols;
-        for (const auto& pk_col_name : storage->getPrimaryKeyColumns()) {
+        for (const auto& pk_col_name : metadata_snapshot->getPrimaryKeyColumns()) {
             LOG_INFO(logger, "Primary key column: '{}'.", pk_col_name);
             pk_cols.push_back(block.getByName(pk_col_name).column);
         }
 
         Columns cols;
-        for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
+        for (const auto& col_name_type : metadata_snapshot->getColumns().getAllPhysical()) {
             LOG_INFO(logger, "Column: '{}'.", col_name_type.name);
             cols.push_back(block.getByName(col_name_type.name).column);
         }
@@ -300,13 +303,13 @@ class TableWriter : public IBlockOutputStream {
             storage->table.insert_or_assign(key, row);
         }
 
-        if ((++storage->table_size) % 2 == 0) {
+        if ((++storage->table_size) % (8192*32) == 0) {
             LOG_INFO(logger,
                      "Merging HTAP table '{}' with base storage.",
                      storage->getStorageID().getFullTableName());
 
             MutableColumns data_columns;
-            for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
+            for (const auto& col_name_type : metadata_snapshot->getColumns().getAllPhysical()) {
                 data_columns.push_back(col_name_type.type->createColumn());
             }
             for (const auto& row_pair : storage->table) {
@@ -316,11 +319,11 @@ class TableWriter : public IBlockOutputStream {
                 }
             }
 
-            Block batch_data = storage->getSampleBlock();
+            Block batch_data = metadata_snapshot->getSampleBlock();
             batch_data.setColumns(std::move(data_columns));
 
-            storage->base_storage->write(nullptr, context)->write(batch_data);
-            storage->base_storage->optimize(nullptr, nullptr, true, false, context);
+            storage->base_storage->write(nullptr, metadata_snapshot, context)->write(batch_data);
+            storage->base_storage->optimize(nullptr, metadata_snapshot, nullptr, true, false, context);
 
             LOG_INFO(logger,
                      "HTAP table '{}' merged with base storage.",
@@ -333,11 +336,12 @@ class TableWriter : public IBlockOutputStream {
   private:
     StorageHTAP* storage;
     const Context& context;
+    StorageMetadataPtr metadata_snapshot;
 };
 
 StorageHTAP::StorageHTAP(const StorageFactory::Arguments& args)
-    : IStorage(args.table_id) {
-    Logger* logger = &Logger::get("StorageHTAP");
+    : IStorage(args.table_id)
+    ,logger(&Poco::Logger::get("StorageHTAP"))  {
 
     if (args.storage_def->primary_key == nullptr) {
         throw Exception("Primary key must be defined for HTAP tables.",
@@ -365,11 +369,11 @@ StorageHTAP::StorageHTAP(const StorageFactory::Arguments& args)
     const auto& storages = StorageFactory::instance().getAllStorages();
     base_storage = (storages.at("ReplacingMergeTree").creator_fn(copy));
 
-    setColumns(args.columns);
-    setSortingKey(base_storage->getSortingKey());
-    setPrimaryKey(base_storage->getPrimaryKey());
+    auto base_memory_metadata = base_storage->getInMemoryMetadata();
+    StorageInMemoryMetadata in_memory_metadata(base_memory_metadata);
+    setInMemoryMetadata(in_memory_metadata);
 
-    for (const auto& pk_col : getPrimaryKeyColumns()) {
+    for (const auto& pk_col : getInMemoryMetadataPtr()->getPrimaryKeyColumns()) {
         LOG_INFO(logger, "HTAP Primary key column: '{}'.", pk_col);
     }
 
@@ -377,7 +381,7 @@ StorageHTAP::StorageHTAP(const StorageFactory::Arguments& args)
 }
 
 void StorageHTAP::startup() {
-    Logger* logger = &Logger::get("StorageHTAP");
+    //Logger* logger = &Logger::get("StorageHTAP");
 
     LOG_INFO(logger, "Starting up HTAP table '{}'.", getStorageID().getFullTableName());
     base_storage->startup();
@@ -385,82 +389,131 @@ void StorageHTAP::startup() {
 }
 
 void StorageHTAP::shutdown() {
-    Logger* logger = &Logger::get("StorageHTAP");
+    //Logger* logger = &Logger::get("StorageHTAP");
 
     LOG_INFO(logger, "Shutting down HTAP table '{}'.", getStorageID().getFullTableName());
     base_storage->shutdown();
     LOG_INFO(logger, "HTAP table '{}' shutdown.", getStorageID().getFullTableName());
 }
 
-Pipes StorageHTAP::read(const Names& column_names,
+Pipe StorageHTAP::read(const Names& column_names,
+                        const StorageMetadataPtr & metadata_snapshot,
                         const SelectQueryInfo& query_info,
                         const Context& context,
                         QueryProcessingStage::Enum processed_stage,
                         size_t max_block_size,
-                        unsigned) {
-    Logger* logger = &Logger::get("StorageHTAP");
+                        unsigned int num_streams) {
 
-    check(column_names);
+    metadata_snapshot->check(column_names, getVirtuals(), getStorageID());
 
-    std::lock_guard lock(mutex);
+    NameSet column_names_set = NameSet(column_names.begin(), column_names.end());
+    auto lock = base_storage->lockForShare(context.getCurrentQueryId(), context.getSettingsRef().lock_acquire_timeout);
+    const StorageMetadataPtr & base_metadata = base_storage->getInMemoryMetadataPtr();
 
-    Names column_names_with_pks = getPrimaryKeyColumns();
-    for (const auto& col_name : column_names) {
-        bool pk_col = false;
-        for (const auto& pk_name : getPrimaryKeyColumns()) {
-            if (col_name == pk_name) {
-                pk_col = true;
-                break;
-            }
-        }
-        if (!pk_col) {
-            column_names_with_pks.push_back(col_name);
+    Block base_header = base_metadata->getSampleBlock();
+    ColumnWithTypeAndName & sign_column = base_header.getByPosition(base_header.columns() - 2);
+
+    // filter deleted records  _sign = -1
+    String filter_column_name;
+    Names require_columns_name = column_names;
+    ASTPtr expressions = std::make_shared<ASTExpressionList>();
+    if (column_names_set.empty() || !column_names_set.count(sign_column.name))
+    {
+        require_columns_name.emplace_back(sign_column.name);
+
+        const auto & sign_column_name = std::make_shared<ASTIdentifier>(sign_column.name);
+        const auto & fetch_sign_value = std::make_shared<ASTLiteral>(Field(Int8(1)));
+
+        expressions->children.emplace_back(makeASTFunction("equals", sign_column_name, fetch_sign_value));
+        filter_column_name = expressions->children.back()->getColumnName();
+
+        for (const auto & column_name : column_names)
+        {
+            expressions->children.emplace_back(std::make_shared<ASTIdentifier>(column_name));
         }
     }
-    Pipes pipes = base_storage->read(column_names_with_pks,
-                                     query_info,
-                                     context,
-                                     processed_stage,
-                                     max_block_size,
-                                     1);
 
-    auto reader_count = std::make_shared<int>(pipes.size());
-    LOG_INFO(logger, "Read pipe count {}", *reader_count);
-    if (*reader_count == 0) {
-        pipes.emplace_back(std::make_shared<TableReader>(column_names, this));
+    Pipe base_pipe = base_storage->read(require_columns_name, base_metadata, query_info, context, processed_stage, max_block_size, num_streams);
+    base_pipe.addTableLock(lock);
+
+    if (!expressions->children.empty() && !base_pipe.empty())
+    {
+        Block pipe_header = base_pipe.getHeader();
+        auto syntax = TreeRewriter(context).analyze(expressions, pipe_header.getNamesAndTypesList());
+        ExpressionActionsPtr expression_actions = ExpressionAnalyzer(expressions, syntax, context).getActions(true);
+
+        base_pipe.addSimpleTransform([&](const Block & header)
+                                {
+                                    return std::make_shared<FilterTransform>(header, expression_actions, filter_column_name, false);
+                                });
+    }
+
+    auto reader_count = std::make_shared<int>(1);
+    Pipe pipe;
+    if (base_pipe.empty()) {
+        pipe = Pipe(std::make_shared<TableReader>(require_columns_name, this));
     } else {
-        for (auto& pipe : pipes) {
-            pipe.addSimpleTransform(std::make_shared<TableMerger>(pipe.getHeader(),
-                                                                  column_names,
-                                                                  reader_count,
-                                                                  this));
-        }
+        base_pipe.addSimpleTransform( [&](const Block & header) {
+            return std::make_shared<TableMerger>(header,
+                                                column_names,
+                                                reader_count,
+                                                this);
+        });
+        pipe = std::move(base_pipe);
     }
 
-    return pipes;
+    return pipe;
 }
 
-BlockOutputStreamPtr StorageHTAP::write(const ASTPtr&,
+BlockOutputStreamPtr StorageHTAP::write(const ASTPtr& /*query*/,
+                                        const StorageMetadataPtr & metadata_snapshot,
                                         const Context& context) {
-    return std::make_shared<TableWriter>(this, context);
+
+    // enable WAL, InMemoryPart,
+    // return getBaseStorage()->write(query, metadata_snapshot, context);
+
+    // Option B. TODO:
+    return std::make_shared<TableWriter>(this, metadata_snapshot, context);
 }
 
 bool StorageHTAP::optimize(const DB::ASTPtr& query,
+                           const StorageMetadataPtr & metadata_snapshot,
                            const DB::ASTPtr& partition,
                            bool,
                            bool,
                            const DB::Context& context) {
-    Logger* logger = &Logger::get("StorageHTAP");
+    //Poco::Logger* logger = &Logger::get("StorageHTAP");
+
+    // TODO:  refactor it
+    // flush & call base optimze()
+    std::lock_guard lock(mutex);
+    MutableColumns data_columns;
+    for (const auto& col_name_type : getInMemoryMetadataPtr()->getColumns().getAllPhysical()) {
+        data_columns.push_back(col_name_type.type->createColumn());
+    }
+    for (const auto& row_pair : table) {
+        const Tuple& row = row_pair.second;
+        for (size_t i = 0; i < data_columns.size(); i++) {
+            data_columns[i]->insert(row[i]);
+        }
+    }
+
+    Block batch_data = metadata_snapshot->getSampleBlock();
+    batch_data.setColumns(std::move(data_columns));
+
+    base_storage->write(nullptr, metadata_snapshot, context)->write(batch_data);
 
     LOG_INFO(logger, "Optimizing HTAP table '{}'.", getStorageID().getFullTableName());
-    bool ret = base_storage->optimize(query, partition, true, true, context);
+    bool ret = base_storage->optimize(query, metadata_snapshot, partition, true, true, context);
     LOG_INFO(logger, "HTAP table '{}' optimized.", getStorageID().getFullTableName());
+
+    table.clear();
 
     return ret;
 }
 
 void StorageHTAP::mutate(const MutationCommands& commands, const Context& query_context) {
-    Logger* logger = &Logger::get("StorageHTAP");
+    //Poco::Logger* logger = &Logger::get("StorageHTAP");
 
     LOG_INFO(logger, "Mutating HTAP table '{}'.", getStorageID().getFullTableName());
     base_storage->mutate(commands, query_context);
@@ -468,7 +521,7 @@ void StorageHTAP::mutate(const MutationCommands& commands, const Context& query_
 }
 
 void StorageHTAP::drop() {
-    Logger* logger = &Logger::get("StorageHTAP");
+    // Poco::Logger* logger = &Logger::get("StorageHTAP");
 
     std::lock_guard lock(mutex);
     LOG_INFO(logger, "Dropping HTAP table '{}'.", getStorageID().getFullTableName());
@@ -477,25 +530,51 @@ void StorageHTAP::drop() {
     LOG_INFO(logger, "HTAP table '{}' dropped.", getStorageID().getFullTableName());
 }
 
-void StorageHTAP::truncate(const ASTPtr& astPtr,
-                           const Context& context,
-                           TableStructureWriteLockHolder& lockHolder) {
-    Logger* logger = &Logger::get("StorageHTAP");
+void StorageHTAP::truncate(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        const Context & context,
+        TableExclusiveLockHolder & lockHolder) {
+    //Logger* logger = &Logger::get("StorageHTAP");
 
-    std::lock_guard lock(mutex);
+    // std::lock_guard lock(mutex);
+
+
     LOG_INFO(logger, "Truncating HTAP table '{}'.", getStorageID().getFullTableName());
-    table.clear();
-    base_storage->truncate(astPtr, context, lockHolder);
+
+    // table.clear();
+
+
+    base_storage->truncate(query, metadata_snapshot, context, lockHolder);
     LOG_INFO(logger, "HTAP table '{}' truncated.", getStorageID().getFullTableName());
 }
 
 std::optional<UInt64> StorageHTAP::totalRows() const {
     std::lock_guard lock(mutex);
+
+    // TODO: + base rows?
     return table.size();
 }
 
+NamesAndTypesList StorageHTAP::getVirtuals() const
+{
+    /// If the background synchronization thread has exception.
+    return base_storage->getVirtuals();
+}
+
+IStorage::ColumnSizeByName StorageHTAP::getColumnSizes() const
+{
+    auto sizes = base_storage->getColumnSizes();
+    auto base_header = base_storage->getInMemoryMetadataPtr()->getSampleBlock();
+    String sign_column_name = base_header.getByPosition(base_header.columns() - 2).name;
+    String version_column_name = base_header.getByPosition(base_header.columns() - 1).name;
+    sizes.erase(sign_column_name);
+    sizes.erase(version_column_name);
+    return sizes;
+}
+
 static StoragePtr createHTAP(const StorageFactory::Arguments& args) {
-    Logger* logger = &Logger::get("StorageHTAP");
+    Poco::Logger* logger = &Poco::Logger::get("StorageHTAP");
 
     LOG_INFO(logger, "Create an HTAP table '{}'.", args.table_id.getFullTableName());
 
